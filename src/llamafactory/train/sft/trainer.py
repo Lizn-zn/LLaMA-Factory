@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING, Any, Optional, Union
 
 import numpy as np
 import torch
+import torch.nn as nn
 from transformers import Seq2SeqTrainer
 from typing_extensions import override
 
@@ -42,6 +43,40 @@ if TYPE_CHECKING:
 
 logger = logging.get_logger(__name__)
 
+def _compute_loss_func(outputs, labels, num_items_in_batch=None, weights=None):
+    """
+    have checked that the loss is correct (i.e., equals to output.loss) when setting weights = 1.0
+    """
+    logits = outputs["logits"] if isinstance(outputs, dict) else outputs[0]
+    # Upcast to float if we need to compute the loss to avoid potential precision issues
+    logits = logits.float()
+
+    # Shift so that tokens < n predict n
+    labels = nn.functional.pad(labels, (0, 1), value=-100) # ignore_index
+    shift_labels = labels[..., 1:].contiguous()
+    shift_labels = shift_labels.view(labels.shape[0], -1)
+    shift_labels = shift_labels.to(logits.device)
+
+    # Flatten the tokens
+    logits = logits.transpose(-2, -1)
+    # Enable model parallelism
+    loss = _weighted_cross_entropy(logits, shift_labels, num_items_in_batch, weights=weights)
+    return loss
+
+def _weighted_cross_entropy(
+    source: torch.Tensor,
+    target: torch.Tensor,
+    num_items_in_batch: Optional[torch.Tensor] = None,
+    weights: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    losses = nn.functional.cross_entropy(source, target, reduction="none")
+    if weights is not None:
+        losses = losses.sum(dim=-1) * weights
+    if num_items_in_batch is not None:
+        loss = losses.sum() / num_items_in_batch
+    else:
+        loss = losses.mean()
+    return loss
 
 class CustomSeq2SeqTrainer(Seq2SeqTrainer):
     r"""Inherits Seq2SeqTrainer to compute generative metrics such as BLEU and ROUGE."""
@@ -77,6 +112,8 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
 
             self.accelerator.clip_grad_norm_ = MethodType(clip_grad_norm_old_version, self.accelerator)
             self.add_callback(BAdamCallback)
+            
+        self.compute_loss_func = _compute_loss_func
 
     @override
     def create_optimizer(self) -> "torch.optim.Optimizer":
@@ -97,10 +134,6 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             return torch.utils.data.SequentialSampler(self.train_dataset)
 
         return super()._get_train_sampler(*args, **kwargs)
-
-    @override
-    def compute_loss(self, model, inputs, *args, **kwargs):
-        return super().compute_loss(model, inputs, *args, **kwargs)
 
     @override
     def prediction_step(
@@ -163,3 +196,48 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         with open(output_prediction_file, "w", encoding="utf-8") as f:
             for text, pred, label in zip(decoded_inputs, decoded_preds, decoded_labels):
                 f.write(json.dumps({"prompt": text, "predict": pred, "label": label}, ensure_ascii=False) + "\n")
+
+    @override
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        """
+        How the loss is computed by Trainer. By default, all models return the loss in the first element.
+
+        Subclass and override for custom behavior.
+        """
+        if (self.label_smoother is not None or self.compute_loss_func is not None) and "labels" in inputs:
+            # labels = inputs.pop("labels")
+            labels = inputs["labels"]
+        else:
+            labels = None
+        if self.model_accepts_loss_kwargs:
+            loss_kwargs = {}
+            if num_items_in_batch is not None:
+                loss_kwargs["num_items_in_batch"] = num_items_in_batch
+            inputs = {**inputs, **loss_kwargs}
+        outputs = model(**inputs)
+        
+        # Save past state if it exists
+        # TODO: this needs to be fixed and made cleaner later.
+        if self.args.past_index >= 0:
+            self._past = outputs[self.args.past_index]
+
+        if labels is not None:
+            loss = self.compute_loss_func(outputs, labels, num_items_in_batch=num_items_in_batch, weights=inputs["weights"])
+        else:
+            if isinstance(outputs, dict) and "loss" not in outputs:
+                raise ValueError(
+                    "The model did not return a loss from the inputs, only the following keys: "
+                    f"{','.join(outputs.keys())}. For reference, the inputs it received are {','.join(inputs.keys())}."
+                )
+            # We don't use .loss here since the model may return tuples instead of ModelOutput.
+            loss = outputs["loss"] if isinstance(outputs, dict) else outputs[0]
+
+        if (
+            self.args.average_tokens_across_devices
+            and (self.model_accepts_loss_kwargs or self.compute_loss_func)
+            and num_items_in_batch is not None
+        ):
+            loss *= self.accelerator.num_processes
+
+        return (loss, outputs) if return_outputs else loss
+    

@@ -108,10 +108,12 @@ class MultiModalDataCollatorForSeq2Seq(DataCollatorForSeq2Seq):
     def __call__(self, features: list[dict[str, Any]]) -> dict[str, "torch.Tensor"]:
         batch_images, batch_videos, batch_audios = [], [], []
         batch_imglens, batch_vidlens, batch_audlens, batch_input_ids = [], [], [], []
+        batch_weights = []
         for feature in features:
             images = feature.pop("images", None) or []
             videos = feature.pop("videos", None) or []
             audios = feature.pop("audios", None) or []
+            weights = feature.pop("weight", 1)
             batch_images.extend(images)
             batch_videos.extend(videos)
             batch_audios.extend(audios)
@@ -119,7 +121,8 @@ class MultiModalDataCollatorForSeq2Seq(DataCollatorForSeq2Seq):
             batch_vidlens.append(len(videos))
             batch_audlens.append(len(audios))
             batch_input_ids.append(feature["input_ids"])
-
+            batch_weights.append(weights)
+            
         fake_input_ids = []
         if (
             self.template.mm_plugin.image_token is not None and sum(batch_imglens) == 0 and sum(batch_vidlens) == 0
@@ -179,7 +182,7 @@ class MultiModalDataCollatorForSeq2Seq(DataCollatorForSeq2Seq):
             token_type_ids = mm_inputs.pop("token_type_ids")
             for i, feature in enumerate(features):
                 feature["token_type_ids"] = token_type_ids[i]
-
+        
         features: dict[str, torch.Tensor] = super().__call__(features)
 
         if self.get_rope_func is not None:
@@ -229,6 +232,10 @@ class MultiModalDataCollatorForSeq2Seq(DataCollatorForSeq2Seq):
             features["position_ids"] = torch.arange(seq_length).long().repeat(bsz, 1)
             return {"data": features, "input_ids": features["input_ids"], "labels": features["labels"]}
 
+        # update weight
+        weights = torch.tensor(batch_weights, dtype=torch.float32)
+        features.update({"weights": weights})
+        
         return features
 
 
@@ -248,7 +255,6 @@ class SFTDataCollatorWith4DAttentionMask(MultiModalDataCollatorForSeq2Seq):
         for key, value in features.items():  # cast data dtype for paligemma
             if torch.is_tensor(value) and torch.is_floating_point(value):
                 features[key] = value.to(self.compute_dtype)
-
         return features
 
 

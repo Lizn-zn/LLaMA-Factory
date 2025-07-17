@@ -177,3 +177,5 @@ wandb/
 swanlog/
 generated_predictions.jsonl
 predictions_score.json
+data/solver_train_data.json
+data/prover_train_data.json

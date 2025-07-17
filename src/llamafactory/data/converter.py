@@ -122,6 +122,7 @@ class AlpacaDatasetConverter(DatasetConverter):
         output = {
             "_prompt": prompt,
             "_response": response,
+            "_weight": example[self.dataset_attr.weight] if self.dataset_attr.weight else 1.0,
             "_system": example[self.dataset_attr.system] if self.dataset_attr.system else "",
             "_tools": example[self.dataset_attr.tools] if self.dataset_attr.tools else "",
             "_images": self._find_medias(example[self.dataset_attr.images]) if self.dataset_attr.images else None,
@@ -265,6 +266,7 @@ def align_dataset(
     _images: []
     _videos: []
     _audios: []
+    _weight: 1
     """
     column_names = list(next(iter(dataset)).keys())
     kwargs = {}
@@ -274,7 +276,6 @@ def align_dataset(
             load_from_cache_file=(not data_args.overwrite_cache) or (training_args.local_process_index != 0),
             desc="Converting format of dataset",
         )
-
     dataset_converter = get_dataset_converter(dataset_attr.formatting, dataset_attr, data_args)
     return dataset.map(
         dataset_converter,
